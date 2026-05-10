@@ -1,0 +1,520 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "chore/**"
+      - "feature/**"
+      - "fix/**"
+  pull_request:
+    branches:
+      - main
+  merge_group:
+    types:
+      - checks_requested
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  dependency-review:
+    name: Dependency Review
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
+        with:
+          fail-on-severity: moderate
+          allow-licenses: >-
+            MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, 0BSD,
+            BlueOak-1.0.0, CC-BY-4.0, CC0-1.0, Python-2.0,
+            Unlicense
+
+  reuse:
+    name: REUSE Compliance
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.draft == false
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Install REUSE tool
+        run: >-
+          python3 -m pip install --user --disable-pip-version-check reuse==6.2.0
+
+      - name: REUSE lint
+        run: python3 -m reuse lint
+
+  quality:
+    name: Quality Gates
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.draft == false
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Quality gate parity
+        run: pnpm run check:quality
+
+  unit:
+    name: Unit Tests (Node ${{ matrix.node_major }})
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.draft == false
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - node: 22.22.2
+            node_major: 22
+          - node: 24.15.0
+            node_major: 24
+          - node: 26.3.0
+            node_major: 26
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Unit coverage
+        run: pnpm run test:coverage
+
+      - name: Upload JUnit results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: junit-node-${{ matrix.node_major }}
+          path: test-results/**/*.xml
+          if-no-files-found: warn
+
+      - name: Upload coverage artifact
+        if: ${{ !cancelled() && matrix.node == '26.3.0' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: coverage
+          path: coverage
+          if-no-files-found: ignore
+
+  integration:
+    name: SSH Integration
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.draft == false
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Start SSH fixture
+        run: pnpm run docker:ssh-fixture:up
+
+      - name: Run integration tests
+        run: pnpm run test:integration
+        env:
+          RUN_SSH_INTEGRATION: "1"
+          TEST_SSH_HOST: localhost
+          TEST_SSH_PORT: "2222"
+          TEST_SSH_USER: testuser
+          TEST_SSH_PASS: testpass
+
+      - name: Stop SSH fixture
+        if: ${{ !cancelled() }}
+        run: pnpm run docker:ssh-fixture:down
+
+      - name: Upload integration JUnit results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: junit-integration
+          path: test-results/**/*.xml
+          if-no-files-found: warn
+
+  integration-windows:
+    name: Windows Integration
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.draft == false
+      }}
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Windows integration tests
+        run: pnpm run test:integration:windows
+        env:
+          RUN_WINDOWS_SSH_INTEGRATION: "1"
+
+      - name: Upload Windows integration JUnit results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: junit-integration-windows
+          path: test-results/**/*.xml
+          if-no-files-found: warn
+
+  e2e:
+    name: SSH E2E
+    if: >-
+      ${{
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.draft == false
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Start SSH fixture
+        run: pnpm run docker:ssh-fixture:up
+
+      - name: Run E2E tests
+        run: pnpm run test:e2e
+        env:
+          RUN_SSH_E2E: "1"
+          TEST_SSH_HOST: localhost
+          TEST_SSH_PORT: "2222"
+          TEST_SSH_USER: testuser
+          TEST_SSH_PASS: testpass
+
+      - name: Stop SSH fixture
+        if: ${{ !cancelled() }}
+        run: pnpm run docker:ssh-fixture:down
+
+      - name: Upload E2E JUnit results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: junit-e2e
+          path: test-results/**/*.xml
+          if-no-files-found: warn
+
+  perf:
+    name: Performance Baseline
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Start SSH fixture
+        run: pnpm run docker:ssh-fixture:up
+
+      - name: Run performance baseline
+        run: pnpm run test:perf
+        env:
+          TEST_SSH_HOST: localhost
+          TEST_SSH_PORT: "2222"
+          TEST_SSH_USER: testuser
+          TEST_SSH_PASS: testpass
+
+      - name: Stop SSH fixture
+        if: ${{ !cancelled() }}
+        run: pnpm run docker:ssh-fixture:down
+
+      - name: Upload perf JUnit results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: junit-perf
+          path: test-results/**/*.xml
+          if-no-files-found: warn
+
+  dependency-freshness:
+    name: Dependency Freshness
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate dependency freshness report
+        id: freshness
+        continue-on-error: true
+        run: pnpm run check:freshness
+
+      - name: Upload dependency freshness report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dependency-freshness
+          path: artifacts/dependency-freshness.*
+          if-no-files-found: warn
+
+      - name: Fail on dependency freshness policy breach
+        if: ${{ steps.freshness.outcome == 'failure' }}
+        run: exit 1
+
+  mutation:
+    name: Mutation Tests (advisory)
+    if: >-
+      ${{
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_dispatch'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Run mutation tests
+        run: pnpm run test:mutation:ci
+
+      - name: Generate mutation summary
+        if: ${{ !cancelled() }}
+        run: node scripts/generate-mutation-summary.mjs
+
+      - name: Upload mutation report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mutation-report
+          path: reports/mutation
+          if-no-files-found: warn
+
+  package:
+    name: Build, SBOM, and Pack
+    if: >-
+      ${{
+        github.repository == 'oaslananka/ssh-mcp-pro' &&
+        (github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false)
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs:
+      - quality
+      - unit
+      - integration
+      - integration-windows
+      - e2e
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: 26.3.0
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: |
+          set -euo pipefail
+          corepack enable
+          corepack prepare pnpm@11.5.1 --activate
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Package parity
+        run: pnpm run check:package
+
+      - name: Generate CycloneDX SBOM and package hash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          pnpm run sbom
+          PACKAGE_FILE="$(
+            pnpm pack --pack-destination artifacts --json |
+              node scripts/extract-pack-filename.mjs
+          )"
+          sha256sum "artifacts/$PACKAGE_FILE" > "artifacts/$PACKAGE_FILE.sha256"
+
+      - name: Upload release verification artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-verification
+          path: artifacts
+
+  docker:
+    name: Docker Smoke
+    if: >-
+      ${{
+        github.repository == 'oaslananka/ssh-mcp-pro' &&
+        (github.event_name != 'pull_request' ||
+          github.event.pull_request.draft == false)
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs:
+      - package
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Build production image
+        run: docker build -t ssh-mcp-pro:ci .
+
+      - name: Smoke CLI
+        run: |
+          docker run --rm ssh-mcp-pro:ci --version
+          docker run --rm ssh-mcp-pro:ci --help

@@ -1,0 +1,208 @@
+name: Docker
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+      - "ssh-mcp-pro-v*"
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Release tag or ref to publish, for example ssh-mcp-pro-v1.1.4"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ghcr.io/oaslananka/ssh-mcp-pro
+  PLATFORMS: linux/amd64,linux/arm64
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build and smoke image
+    if: ${{ github.repository == 'oaslananka/ssh-mcp-pro' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
+
+      - name: Build local image
+        run: |
+          docker build \
+            --build-arg VCS_REF="${GITHUB_SHA}" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t ssh-mcp-pro:local \
+            .
+
+      - name: Smoke CLI
+        run: |
+          docker run --rm ssh-mcp-pro:local --version
+          docker run --rm ssh-mcp-pro:local --help
+
+      - name: Smoke image labels
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect ssh-mcp-pro:local --format '{{ index .Config.Labels "org.opencontainers.image.title" }}')" = "ssh-mcp-pro"
+          test "$(docker image inspect ssh-mcp-pro:local --format '{{ index .Config.Labels "org.opencontainers.image.source" }}')" = "https://github.com/oaslananka/ssh-mcp-pro"
+          test "$(docker image inspect ssh-mcp-pro:local --format '{{ index .Config.Labels "org.opencontainers.image.documentation" }}')" = "https://github.com/oaslananka/ssh-mcp-pro/blob/main/docs/docker.md"
+          test "$(docker image inspect ssh-mcp-pro:local --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = "MIT"
+          test "$(docker image inspect ssh-mcp-pro:local --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = "${GITHUB_SHA}"
+
+      - name: Create Buildx check builder
+        run: docker buildx create --name ssh-mcp-pro-check --driver docker-container --bootstrap --use
+
+      - name: Check multi-platform Dockerfile support
+        run: docker buildx build --check --platform "${PLATFORMS}" .
+
+  publish-ghcr:
+    name: Publish GHCR image
+    if: |
+      github.repository == 'oaslananka/ssh-mcp-pro' && (
+        (github.event_name == 'push' && github.ref_type == 'tag' && (startsWith(github.ref_name, 'v') || startsWith(github.ref_name, 'ssh-mcp-pro-v'))) ||
+        (github.event_name == 'release' && github.event.action == 'published') ||
+        github.event_name == 'workflow_dispatch'
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs:
+      - build
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION_TAG: ${{ github.event.release.tag_name || inputs.ref || github.ref_name }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ env.VERSION_TAG }}
+
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+          if ! echo "${VERSION_TAG}" | grep -Eq '^(v|ssh-mcp-pro-v)[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "release tag must be v2.1.1 or ssh-mcp-pro-v2.1.1, got: ${VERSION_TAG}"
+            exit 1
+          fi
+          git rev-parse -q --verify "refs/tags/${VERSION_TAG}" >/dev/null
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GHCR_ACTOR: ${{ github.actor }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GHCR_ACTOR" --password-stdin
+
+      - name: Set up QEMU for multi-architecture builds
+        run: docker run --rm --privileged tonistiigi/binfmt --install arm64
+
+      - name: Create Buildx builder
+        run: docker buildx create --name ssh-mcp-pro-release --driver docker-container --bootstrap --use
+
+      - name: Build and push multi-platform image
+        id: publish
+        run: |
+          set -euo pipefail
+          case "${VERSION_TAG}" in
+            v*)
+              VERSION="${VERSION_TAG#v}"
+              ;;
+            ssh-mcp-pro-v*)
+              VERSION="${VERSION_TAG#ssh-mcp-pro-v}"
+              ;;
+            *)
+              echo "unsupported release tag: ${VERSION_TAG}"
+              exit 1
+              ;;
+          esac
+          mkdir -p artifacts
+          docker buildx build \
+            --platform "${PLATFORMS}" \
+            --build-arg VCS_REF="$(git rev-list -n 1 "$VERSION_TAG")" \
+            --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.ref.name=${VERSION_TAG}" \
+            -t "${IMAGE_NAME}:${VERSION}" \
+            -t "${IMAGE_NAME}:${VERSION_TAG}" \
+            --metadata-file artifacts/ghcr-image-metadata.json \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            .
+          DIGEST="$(jq -r '."containerimage.digest"' artifacts/ghcr-image-metadata.json)"
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "expected manifest digest in artifacts/ghcr-image-metadata.json, got: ${DIGEST}"
+            exit 1
+          fi
+          jq \
+            --arg image "${IMAGE_NAME}" \
+            --arg version "${VERSION}" \
+            --arg release_tag "${VERSION_TAG}" \
+            --arg platforms "${PLATFORMS}" \
+            --arg digest "${DIGEST}" \
+            '{image:$image, version:$version, releaseTag:$release_tag, platforms:($platforms | split(",")), digest:$digest, buildMetadata:.}' \
+            artifacts/ghcr-image-metadata.json > artifacts/ghcr-release-image.json
+          {
+            echo "version=${VERSION}"
+            echo "release_tag=${VERSION_TAG}"
+            echo "digest=${DIGEST}"
+            echo "image=${IMAGE_NAME}@${DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify published registry metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.publish.outputs.digest }}"
+          docker buildx imagetools inspect "${IMAGE_NAME}@${DIGEST}" --raw > artifacts/ghcr-manifest.json
+          for PLATFORM in ${PLATFORMS//,/ }; do
+            OS="${PLATFORM%%/*}"
+            ARCH="${PLATFORM##*/}"
+            jq -e --arg os "$OS" --arg arch "$ARCH" \
+              '.manifests[] | select(.platform.os == $os and .platform.architecture == $arch)' \
+              artifacts/ghcr-manifest.json >/dev/null
+          done
+          gh api "/users/${GITHUB_REPOSITORY_OWNER}/packages/container/ssh-mcp-pro/versions" \
+            --jq '[.[] | {id, name, updated_at, tags: .metadata.container.tags}]' \
+            > artifacts/ghcr-package-versions.json
+          jq -e --arg version "${{ steps.publish.outputs.version }}" --arg release_tag "${{ steps.publish.outputs.release_tag }}" \
+            'map(select((.tags // []) | index($version) and index($release_tag))) | length > 0' \
+            artifacts/ghcr-package-versions.json >/dev/null
+
+      - name: Publish image digest summary
+        run: |
+          {
+            echo "## GHCR image"
+            echo
+            echo "- Image: \`${{ steps.publish.outputs.image }}\`"
+            echo "- Tags: \`${{ steps.publish.outputs.version }}\`, \`${{ steps.publish.outputs.release_tag }}\`"
+            echo "- Platforms: \`${PLATFORMS}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload registry verification artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ghcr-release-verification
+          path: artifacts/ghcr-*.json
+          if-no-files-found: error

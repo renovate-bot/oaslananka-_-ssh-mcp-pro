@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+docs/api/
+coverage/
+test-results/
+artifacts/
+reports/
+.cache/
+data/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Local credential files
+secrets/
+*.token
+*.secret
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# MCP Registry auth tokens
+.mcpregistry_*
+
+# SSH keys (for security)
+*.pem
+*.key
+id_*
+
+
+# Package files
+*.tgz
+
+
+# Temp
+*.tmp
+*.temp
+
+# Generated audit reports
+audit-current.json
